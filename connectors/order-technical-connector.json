@@ -10,7 +10,11 @@
   "slot.name": "order_technical_slot",
   "publication.name": "order_technical_pub",
   "publication.autocreate.mode": "filtered",
-  "table.include.list": "public.orders",
+
+  "//": "Topics are derived, not listed: every table in the schema is captured as tech.order.<schema>.<table>, so a new business table needs no connector change. Only the service's own plumbing is excluded — customer_view among it, since a replica of another domain is not this domain's state. To pin the set instead, replace schema.include.list with an explicit table.include.list — it takes precedence.",
+  "schema.include.list": "public",
+  "table.exclude.list": "public.outbox,public.processed_events,public.technical_audit_log,public.schema_migrations,public.customer_view",
+
   "tombstones.on.delete": "false",
   "snapshot.mode": "initial",
   "heartbeat.interval.ms": "10000",

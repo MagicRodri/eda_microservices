@@ -114,21 +114,23 @@ services:
       start_period: 40s
     restart: unless-stopped
 
-  kafka-ui:
-    image: provectuslabs/kafka-ui:v0.7.2
-    container_name: eda-kafka-ui
+  kafdrop:
+    image: obsidiandynamics/kafdrop:4.1.0
+    container_name: eda-kafdrop
     depends_on:
       kafka:
         condition: service_healthy
+      schema-registry:
+        condition: service_healthy
     ports:
-      - "${KAFKA_UI_HOST_PORT:-8080}:8080"
+      - "${KAFDROP_HOST_PORT:-9000}:9000"
     environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
-      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
-      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
-      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
-      DYNAMIC_CONFIG_ENABLED: "true"
+      KAFKA_BROKERCONNECT: kafka:29092
+      # Without the registry Kafdrop shows Avro payloads as raw bytes. With it,
+      # pick "AVRO" as the message format when browsing a topic to see the
+      # decoded records.
+      SCHEMAREGISTRY_CONNECT: http://schema-registry:8081
+      JVM_OPTS: "-Xms64M -Xmx256M"
     restart: unless-stopped
 
   customer-db:
@@ -183,8 +185,11 @@ services:
       <<: *service-env
       DATABASE_URL: postgres://customer:customer@customer-db:5432/customerdb?sslmode=disable
       CONSUMER_GROUP: customer-service
-      BUSINESS_TOPIC: business.order.events
-      TECHNICAL_TOPIC: tech.customer.public.customers
+      # Patterns, not fixed names: the order domain splits its events across
+      # several channels, and the technical stream gets one topic per captured
+      # table. Set BUSINESS_TOPICS / TECHNICAL_TOPICS to pin an exact list.
+      BUSINESS_TOPIC_PATTERN: '^business\.order\..*'
+      TECHNICAL_TOPIC_PATTERN: '^tech\.customer\..*'
 
   order-service:
     <<: *service-common
@@ -204,8 +209,11 @@ services:
       <<: *service-env
       DATABASE_URL: postgres://orders:orders@order-db:5432/ordersdb?sslmode=disable
       CONSUMER_GROUP: order-service
-      BUSINESS_TOPIC: business.customer.events
-      TECHNICAL_TOPIC: tech.order.public.orders
+      # Patterns, not fixed names: the customer domain splits its events across
+      # several channels, and the technical stream gets one topic per captured
+      # table. Set BUSINESS_TOPICS / TECHNICAL_TOPICS to pin an exact list.
+      BUSINESS_TOPIC_PATTERN: '^business\.customer\..*'
+      TECHNICAL_TOPIC_PATTERN: '^tech\.order\..*'
 
 volumes:
   customer-db-data:
