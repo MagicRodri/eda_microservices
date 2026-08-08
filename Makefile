@@ -1,4 +1,4 @@
-.PHONY: help bootstrap up down logs connectors status demo test clean topics
+.PHONY: help bootstrap up down logs connectors status demo test clean topics ui
 
 COMPOSE ?= docker compose
 
@@ -8,6 +8,7 @@ help:
 	@echo "connectors  Register the Debezium connectors with Kafka Connect"
 	@echo "status      Show connector states"
 	@echo "topics      List Kafka topics"
+	@echo "ui          Print the Kafdrop URL"
 	@echo "demo        Run the end-to-end event-loop walkthrough"
 	@echo "logs        Tail the service logs"
 	@echo "test        Run both services' unit tests"
@@ -34,6 +35,9 @@ status:
 
 topics:
 	$(COMPOSE) exec kafka kafka-topics --bootstrap-server kafka:29092 --list
+
+ui:
+	@echo "Kafdrop: http://localhost:$${KAFDROP_HOST_PORT:-9000}"
 
 demo:
 	bash ./scripts/demo.sh

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Walks the full event loop and prints what each step proves.
 #
-#   customer created  ─► business.customer.events ─► order-service view
-#   order placed      ─► business.order.events    ─► spend + tier change
-#   tier change       ─► business.customer.events ─► discount applied
-#   customer blocked  ─► business.customer.events ─► next order refused
+#   customer created  ─► business.customer.lifecycle.events  ─► order-service view
+#   order placed      ─► business.order.lifecycle.events     ─► spend + tier change
+#   tier change       ─► business.customer.loyalty.events    ─► discount applied
+#   customer blocked  ─► business.customer.lifecycle.events  ─► next order refused
+#
+# Two channels per domain, and the consumers subscribe by pattern, so neither
+# service names a topic it reads.
 set -euo pipefail
 
 CUSTOMER_URL="${CUSTOMER_URL:-http://localhost:8091}"
@@ -85,4 +88,5 @@ echo "   HTTP ${code}: $(jq -r .error /tmp/eda-demo-blocked.json)"
 [ "${code}" = "403" ] || { echo "expected 403" >&2; exit 1; }
 
 printf '\n\033[1mDone.\033[0m Customer %s\n' "${CUSTOMER_ID}"
-echo "Inspect the streams at http://localhost:8080 (topics business.* and tech.*)"
+echo "Inspect the streams in Kafdrop at http://localhost:9000 — pick the AVRO"
+echo "message format when browsing business.* or tech.* topics."
