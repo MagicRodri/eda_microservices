@@ -26,11 +26,13 @@ make connectors   # register the four Debezium connectors
 make demo         # walk the whole event loop and assert each hop
 ```
 
-Then open <http://localhost:8080> to browse topics, schemas and connector state.
+Then open <http://localhost:9000> to browse topics and messages in Kafdrop.
+It is wired to the Schema Registry, so selecting **AVRO** as the message format
+when viewing a topic shows decoded records instead of raw bytes.
 
 | Endpoint          | URL                     |
 | ----------------- | ----------------------- |
-| Kafka UI          | http://localhost:8080   |
+| Kafdrop           | http://localhost:9000   |
 | Schema Registry   | http://localhost:8081   |
 | Kafka Connect     | http://localhost:8083   |
 | customer-service  | http://localhost:8091   |
@@ -44,35 +46,76 @@ contract they carry.
 
 ### Technical events — `tech.*`
 
-Raw change-data-capture. One Debezium connector per service tails its
-`customers` / `orders` table and publishes the full Debezium envelope
-(`before`, `after`, `op`, `source`) to `tech.customer.public.customers` and
-`tech.order.public.orders`.
+Raw change-data-capture. One Debezium connector per service publishes the full
+Debezium envelope (`before`, `after`, `op`, `source`), one topic per table.
+
+**Topic names are derived, never listed.** Each connector captures its whole
+`public` schema and excludes only the service's own plumbing, so the topic for
+a table follows automatically as `tech.<domain>.<schema>.<table>` — adding a
+business table produces a new topic with no connector change:
+
+```json
+"schema.include.list": "public",
+"table.exclude.list": "public.outbox,public.processed_events,public.technical_audit_log,public.schema_migrations"
+```
+
+A service that needs to pin the set instead replaces `schema.include.list`
+with an explicit `table.include.list`, which takes precedence. On the consuming
+side the same choice exists: `TECHNICAL_TOPIC_PATTERN` matches the derived
+family, and setting `TECHNICAL_TOPICS` to a comma-separated list overrides it
+with exactly those topics.
 
 The shape of these events *is* the physical table. Rename a column and every
 consumer breaks. They are the right tool for audit, analytics, search indexing
 and replication — infrastructure concerns that legitimately want the raw row.
 
-Each service consumes only **its own** technical topic, into a
+Each service consumes only **its own** technical topics, into a
 `technical_audit_log` table. That is deliberate: it demonstrates the stream
 without ever letting a business decision depend on another service's schema.
 
 ### Business events — `business.*`
 
-Explicit, versioned domain facts, published to `business.customer.events` and
-`business.order.events`:
+Explicit, versioned domain facts. Each event names a **channel**, and the
+channel becomes the topic — so a domain spreads its events over as many topics
+as its consumers need:
 
-| Event                 | Owner            | Meaning                              |
-| --------------------- | ---------------- | ------------------------------------ |
-| `CustomerCreated`     | customer-service | An account was opened                |
-| `CustomerBlocked`     | customer-service | The customer may no longer order     |
-| `CustomerUnblocked`   | customer-service | The restriction was lifted           |
-| `CustomerTierChanged` | customer-service | Spend moved the customer to a tier   |
-| `OrderCreated`        | order-service    | An order was accepted                |
-| `OrderCancelled`      | order-service    | An order was cancelled               |
+| Event                 | Owner            | Channel            | Topic                                 |
+| --------------------- | ---------------- | ------------------ | ------------------------------------- |
+| `CustomerCreated`     | customer-service | `customer.lifecycle` | `business.customer.lifecycle.events` |
+| `CustomerBlocked`     | customer-service | `customer.lifecycle` | `business.customer.lifecycle.events` |
+| `CustomerUnblocked`   | customer-service | `customer.lifecycle` | `business.customer.lifecycle.events` |
+| `CustomerTierChanged` | customer-service | `customer.loyalty`   | `business.customer.loyalty.events`   |
+| `OrderCreated`        | order-service    | `order.lifecycle`    | `business.order.lifecycle.events`    |
+| `OrderCancelled`      | order-service    | `order.settlement`   | `business.order.settlement.events`   |
 
 Their contracts live with their owner, in each repository's `schemas/*.avsc`.
 This is the only surface the services are allowed to couple to.
+
+#### Choosing the split
+
+The connector routes on the `channel` column alone and never learns an event
+type, so the split lives entirely in the owning service — one table:
+
+```go
+func channelFor(eventType string) string {
+    switch eventType {
+    case "CustomerCreated", "CustomerBlocked", "CustomerUnblocked":
+        return channelCustomerLifecycle
+    case "CustomerTierChanged":
+        return channelCustomerLoyalty
+    default:
+        return aggregateTypeCustomer   // never empty: an empty channel would
+    }                                  // route to `business..events`
+}
+```
+
+Moving an event to its own topic is a change to that function plus a redeploy.
+No connector edit, and no interruption for consumers subscribed by pattern.
+
+Consumers therefore subscribe to a *family*, not a name:
+`^business\.customer\..*` picks up both customer channels today and any channel
+added tomorrow. A consumer that only cares about loyalty sets `BUSINESS_TOPICS`
+to `business.customer.loyalty.events` and reads that one topic.
 
 ## Why an outbox
 
@@ -115,9 +158,10 @@ row describing it share a commit LSN. They cannot disagree.
 ```sql
 CREATE TABLE outbox (
     id             UUID PRIMARY KEY,
-    aggregate_type TEXT  NOT NULL,   -- routes the topic: 'customer' | 'order'
+    aggregate_type TEXT  NOT NULL,   -- copied into the aggregateType header
     aggregate_id   TEXT  NOT NULL,   -- becomes the Kafka message key
     event_type     TEXT  NOT NULL,   -- copied into the eventType header
+    channel        TEXT  NOT NULL,   -- routes the topic: business.<channel>.events
     payload        JSONB NOT NULL,   -- expanded into the Avro value
     trace_id       TEXT  NOT NULL DEFAULT '',
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -133,10 +177,14 @@ Debezium's `EventRouter` SMT unwraps the CDC envelope and rewrites the topic
 from the row's own data:
 
 ```json
-"transforms.outbox.route.by.field": "aggregate_type",
+"transforms.outbox.route.by.field": "channel",
 "transforms.outbox.route.topic.replacement": "business.${routedByValue}.events",
 "transforms.outbox.table.expand.json.payload": "true"
 ```
+
+Routing by `channel` rather than `aggregate_type` is what lets one domain
+publish to several topics. `channel` defaults to the aggregate type when a
+writer leaves it empty, so the simple case stays one topic per domain.
 
 `expand.json.payload` is what turns the JSONB column into a real Avro record
 rather than a string, so the registry ends up holding a proper schema for each
@@ -174,7 +222,7 @@ Dedup and effect commit together, so a redelivery cannot double-count a spend.
         │                        tech.customer.public.customers  outbox (routed)
         │                                    │                        │
         │                                    │                        ▼
-        │                                    │           business.customer.events
+        │                                    │      business.customer.{lifecycle,loyalty}.events
         │                                    │                        │
         │                              (audit only)                   ▼
         │                                                   ┌──────────────────┐
@@ -185,7 +233,7 @@ Dedup and effect commit together, so a redelivery cannot double-count a spend.
         │                                                            ▼
         │                                                    orders + outbox (one tx)
         │                                                            │
-        └──────────── business.order.events ◄────────────────────────┘
+        └──── business.order.{lifecycle,settlement}.events ◄──────────┘
                        OrderCreated / OrderCancelled
 ```
 
@@ -231,12 +279,12 @@ publishes, and its unit tests assert every one of them parses.
 
 Four connectors, two per database, registered by `make connectors`:
 
-| Connector                       | Table              | Publishes to                    |
-| ------------------------------- | ------------------ | ------------------------------- |
-| `customer-technical-connector`  | `public.customers` | `tech.customer.public.customers`|
-| `customer-outbox-connector`     | `public.outbox`    | `business.customer.events`      |
-| `order-technical-connector`     | `public.orders`    | `tech.order.public.orders`      |
-| `order-outbox-connector`        | `public.outbox`    | `business.order.events`         |
+| Connector                       | Captures                    | Publishes to                        |
+| ------------------------------- | --------------------------- | ----------------------------------- |
+| `customer-technical-connector`  | every `public` table but plumbing | `tech.customer.<schema>.<table>` |
+| `customer-outbox-connector`     | `public.outbox`             | `business.<channel>.events`         |
+| `order-technical-connector`     | every `public` table but plumbing | `tech.order.<schema>.<table>`    |
+| `order-outbox-connector`        | `public.outbox`             | `business.<channel>.events`         |
 
 Two connectors on one database need separate replication slots and
 publications, which is why each config names its own `slot.name` and
@@ -270,7 +318,7 @@ idempotent — re-run it after editing a file.
 
 ```
 .
-├── docker-compose.yml     # Kafka (KRaft), Schema Registry, Connect, 2x Postgres, UI
+├── docker-compose.yml     # Kafka (KRaft), Schema Registry, Connect, 2x Postgres, Kafdrop
 ├── go.work                # both service modules, for editor tooling
 ├── connectors/            # one JSON config per Debezium connector
 ├── scripts/
