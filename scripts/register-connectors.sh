@@ -15,7 +15,16 @@ for attempt in $(seq 1 60); do
     break
   fi
   if [ "${attempt}" -eq 60 ]; then
-    echo "Kafka Connect did not become ready in time" >&2
+    {
+      echo "Kafka Connect did not become ready in time."
+      echo
+      echo "The worker usually dies at startup rather than hanging. Check why:"
+      echo "  docker compose logs --tail 80 connect"
+      echo
+      echo "A ClassNotFoundException for a converter means the image is missing"
+      echo "a plugin; anything about the plugin path means the connector jar did"
+      echo "not land where CONNECT_PLUGIN_PATH points."
+    } >&2
     exit 1
   fi
   sleep 3
