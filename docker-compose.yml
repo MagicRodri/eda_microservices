@@ -82,7 +82,11 @@ services:
     restart: unless-stopped
 
   connect:
-    image: quay.io/debezium/connect:3.3.0.Final
+    # Built locally: neither stock image has both the Confluent Avro converter
+    # and the Debezium connector. See connect/Dockerfile.
+    build:
+      context: ./connect
+    image: eda-connect:3.3.2
     container_name: eda-connect
     depends_on:
       kafka:
@@ -96,21 +100,28 @@ services:
     ports:
       - "${CONNECT_HOST_PORT:-8083}:8083"
     environment:
-      BOOTSTRAP_SERVERS: kafka:29092
-      GROUP_ID: eda-connect
-      CONFIG_STORAGE_TOPIC: _connect_configs
-      OFFSET_STORAGE_TOPIC: _connect_offsets
-      STATUS_STORAGE_TOPIC: _connect_statuses
-      CONFIG_STORAGE_REPLICATION_FACTOR: 1
-      OFFSET_STORAGE_REPLICATION_FACTOR: 1
-      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # The Confluent image takes CONNECT_-prefixed worker properties, unlike
+      # the Debezium image's bare names.
+      CONNECT_BOOTSTRAP_SERVERS: kafka:29092
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: eda-connect
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect_configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect_offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect_statuses
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
       # Avro on both key and value: every topic's schema is registered in the
       # Schema Registry and messages carry only a schema ID, not the schema.
-      KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
-      VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
       CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
       CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
-      ENABLE_APICURIO_CONVERTERS: "false"
+      # /usr/share/java holds the Avro converter, confluent-hub-components the
+      # Debezium connector added by connect/Dockerfile.
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+      KAFKA_HEAP_OPTS: ${CONNECT_HEAP_OPTS:--Xms256M -Xmx1G}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8083/connectors"]
       interval: 10s

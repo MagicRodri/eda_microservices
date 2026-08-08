@@ -294,6 +294,28 @@ publication scoped to its own table.
 Configs are PUT to `/connectors/<name>/config`, so `make connectors` is
 idempotent — re-run it after editing a file.
 
+### Why Connect is built locally
+
+Neither stock image carries both halves of what this stack needs, so
+[`connect/Dockerfile`](connect/Dockerfile) combines them:
+
+- `quay.io/debezium/connect` has the connector and the outbox SMT, but as of
+  3.x it ships the **Apicurio** converters only. A worker configured with
+  `io.confluent.connect.avro.AvroConverter` dies at startup with a
+  `ClassNotFoundException` and never binds its REST port — which looks
+  identical to Connect simply being slow to start.
+- `confluentinc/cp-kafka-connect` has the Confluent Avro converter built in but
+  no Debezium connector.
+
+So the image starts from the Confluent one and unpacks Debezium's
+self-contained plugin tarball into `/usr/share/confluent-hub-components`. That
+tarball includes `debezium-core`, which is where `EventRouter` lives, so the
+outbox SMT comes along with the connector.
+
+Because the Confluent image reads `CONNECT_`-prefixed worker properties rather
+than the Debezium image's bare names, every worker setting in
+`docker-compose.yml` carries that prefix.
+
 ## Operational notes
 
 - **Ordering** holds per partition, and the key is `aggregate_id`, so events
@@ -319,6 +341,7 @@ idempotent — re-run it after editing a file.
 ```
 .
 ├── docker-compose.yml     # Kafka (KRaft), Schema Registry, Connect, 2x Postgres, Kafdrop
+├── connect/Dockerfile     # Confluent Connect + the Debezium connector
 ├── go.work                # both service modules, for editor tooling
 ├── connectors/            # one JSON config per Debezium connector
 ├── scripts/
