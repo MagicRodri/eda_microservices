@@ -1,0 +1,212 @@
+name: eda
+
+x-postgres-common: &postgres-common
+  image: postgres:17-alpine
+  # Logical decoding is what Debezium reads. Without wal_level=logical the
+  # connectors cannot create a replication slot and fail at startup.
+  command:
+    - postgres
+    - -c
+    - wal_level=logical
+    - -c
+    - max_wal_senders=10
+    - -c
+    - max_replication_slots=10
+  restart: unless-stopped
+
+x-service-common: &service-common
+  restart: unless-stopped
+  environment: &service-env
+    HTTP_ADDR: ":8080"
+    KAFKA_BROKERS: kafka:29092
+    SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.9.0
+    container_name: eda-kafka
+    ports:
+      - "${KAFKA_HOST_PORT:-9092}:9092"
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      # In-network clients use kafka:29092; anything on the host uses
+      # localhost:9092. Advertising both is what makes each side reachable.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+    restart: unless-stopped
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.9.0
+    container_name: eda-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${SCHEMA_REGISTRY_HOST_PORT:-8081}:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      # BACKWARD lets a producer add an optional field without stranding
+      # consumers that still read the previous version.
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: BACKWARD
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+    restart: unless-stopped
+
+  connect:
+    image: quay.io/debezium/connect:3.3.0.Final
+    container_name: eda-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      customer-db:
+        condition: service_healthy
+      order-db:
+        condition: service_healthy
+    ports:
+      - "${CONNECT_HOST_PORT:-8083}:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: eda-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Avro on both key and value: every topic's schema is registered in the
+      # Schema Registry and messages carry only a schema ID, not the schema.
+      KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      ENABLE_APICURIO_CONVERTERS: "false"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/connectors"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: eda-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_UI_HOST_PORT:-8080}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+      DYNAMIC_CONFIG_ENABLED: "true"
+    restart: unless-stopped
+
+  customer-db:
+    <<: *postgres-common
+    container_name: eda-customer-db
+    ports:
+      - "${CUSTOMER_DB_HOST_PORT:-5433}:5432"
+    environment:
+      POSTGRES_USER: customer
+      POSTGRES_PASSWORD: customer
+      POSTGRES_DB: customerdb
+    volumes:
+      - customer-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U customer -d customerdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  order-db:
+    <<: *postgres-common
+    container_name: eda-order-db
+    ports:
+      - "${ORDER_DB_HOST_PORT:-5434}:5432"
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+      POSTGRES_DB: ordersdb
+    volumes:
+      - order-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d ordersdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  customer-service:
+    <<: *service-common
+    build:
+      context: ./services/customer-service
+    container_name: eda-customer-service
+    depends_on:
+      customer-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "${CUSTOMER_SERVICE_HOST_PORT:-8091}:8080"
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://customer:customer@customer-db:5432/customerdb?sslmode=disable
+      CONSUMER_GROUP: customer-service
+      BUSINESS_TOPIC: business.order.events
+      TECHNICAL_TOPIC: tech.customer.public.customers
+
+  order-service:
+    <<: *service-common
+    build:
+      context: ./services/order-service
+    container_name: eda-order-service
+    depends_on:
+      order-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "${ORDER_SERVICE_HOST_PORT:-8092}:8080"
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://orders:orders@order-db:5432/ordersdb?sslmode=disable
+      CONSUMER_GROUP: order-service
+      BUSINESS_TOPIC: business.customer.events
+      TECHNICAL_TOPIC: tech.order.public.orders
+
+volumes:
+  customer-db-data:
+  order-db-data:
