@@ -190,6 +190,15 @@ writer leaves it empty, so the simple case stays one topic per domain.
 rather than a string, so the registry ends up holding a proper schema for each
 business topic instead of `{"payload": "string"}`.
 
+There is deliberately no `table.field.event.timestamp`. The router requires that
+field to be an `INT64`, and Debezium maps a `TIMESTAMPTZ` column to
+`io.debezium.time.ZonedTimestamp` — a string — so pointing it at `created_at`
+kills the task on the first row with `Field 'created_at' is not of type INT64`.
+Without it the Kafka record timestamp is the moment Connect produced the record,
+which is what consumers should use for ordering anyway; the domain time is in
+the payload as `occurred_at`. Pointing it at a `TIMESTAMP WITHOUT TIME ZONE`
+column would also work, since those map to an `INT64` microsecond value.
+
 ## At-least-once, and what it costs
 
 The WAL is replayed from the last committed offset, so a crash means

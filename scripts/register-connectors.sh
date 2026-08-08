@@ -38,6 +38,13 @@ for config in "${ROOT}"/connectors/*.json; do
     -H 'Content-Type: application/json' \
     --data @"${config}" \
     "${CONNECT_URL}/connectors/${name}/config" >/dev/null
+
+  # A task killed by "Tolerance exceeded in error handler" stays dead until it
+  # is restarted explicitly — re-registering the config does not revive it, so
+  # a fixed config would otherwise appear to change nothing.
+  curl -fsS -X POST \
+    "${CONNECT_URL}/connectors/${name}/restart?includeTasks=true&onlyFailed=true" \
+    >/dev/null 2>&1 || true
 done
 
 echo
