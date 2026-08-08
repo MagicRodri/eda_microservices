@@ -50,6 +50,11 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      # Without this, recreating the container silently discards every topic —
+      # including _connect_configs, so the registered connectors vanish and
+      # _schemas, so every registered Avro schema goes with them.
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
       interval: 10s
@@ -232,5 +237,6 @@ services:
       TECHNICAL_TOPIC_PATTERN: '^tech\.order\..*'
 
 volumes:
+  kafka-data:
   customer-db-data:
   order-db-data:
