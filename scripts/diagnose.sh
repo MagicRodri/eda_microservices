@@ -18,17 +18,35 @@ kafka_topics() {
   $COMPOSE exec -T kafka kafka-topics --bootstrap-server kafka:29092 --list 2>/dev/null | tr -d '\r'
 }
 
+section "Containers"
+# A worker that is dead, restarting or OOM-killed produces exactly the same
+# empty connector list as one that was simply never given any connectors.
+$COMPOSE ps
+
 section "Connector and task states"
 # A connector reports RUNNING even when every one of its tasks has died, so the
 # task states are the ones that actually matter here.
-for name in $(curl -fsS "${CONNECT_URL}/connectors" 2>/dev/null | jq -r '.[]' | sort); do
-  curl -fsS "${CONNECT_URL}/connectors/${name}/status" | jq -r '
-    "\(.name)
+if ! registered=$(curl -fsS "${CONNECT_URL}/connectors" 2>/dev/null); then
+  echo "  Kafka Connect is NOT answering on ${CONNECT_URL}."
+  echo "  Check the container state above and the connect log below."
+elif [ "$(jq -r 'length' <<<"${registered}")" = "0" ]; then
+  echo "  Connect is up but has no connectors registered."
+  echo "  Its config topic is empty — re-run: make connectors"
+else
+  for name in $(jq -r '.[]' <<<"${registered}" | sort); do
+    curl -fsS "${CONNECT_URL}/connectors/${name}/status" | jq -r '
+      "\(.name)
    connector: \(.connector.state)
    tasks:     \(if (.tasks | length) == 0 then "NONE RUNNING" else ([.tasks[] | .state] | join(", ")) end)",
-    (.tasks[]? | select(.trace != null)
-      | "   trace:\n" + ((.trace | split("\n")[0:12] | map("     " + .) | join("\n"))))'
-done
+      (.tasks[]? | select(.trace != null)
+        | "   trace:\n" + ((.trace | split("\n")[0:12] | map("     " + .) | join("\n"))))'
+  done
+fi
+
+section "connect log"
+$COMPOSE logs --tail 60 --no-log-prefix connect 2>/dev/null \
+  | grep -Ev 'INFO.*(WorkerSourceTask|AbstractCoordinator|ConsumerConfig|ProducerConfig)' \
+  | tail -40
 
 section "Topics"
 kafka_topics | sort | sed 's/^/  /'
