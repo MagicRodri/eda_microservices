@@ -10,7 +10,11 @@
   "slot.name": "customer_technical_slot",
   "publication.name": "customer_technical_pub",
   "publication.autocreate.mode": "filtered",
-  "table.include.list": "public.customers",
+
+  "//": "Topics are derived, not listed: every table in the schema is captured as tech.customer.<schema>.<table>, so a new business table needs no connector change. Only the service's own plumbing is excluded. To pin the set instead, replace schema.include.list with an explicit table.include.list — it takes precedence.",
+  "schema.include.list": "public",
+  "table.exclude.list": "public.outbox,public.processed_events,public.technical_audit_log,public.schema_migrations",
+
   "tombstones.on.delete": "false",
   "snapshot.mode": "initial",
   "heartbeat.interval.ms": "10000",
