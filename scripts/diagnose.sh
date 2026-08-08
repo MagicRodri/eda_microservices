@@ -73,6 +73,18 @@ done
 section "Schema Registry subjects"
 curl -fsS "${REGISTRY_URL}/subjects" 2>/dev/null | jq -r '.[]' | sort | sed 's/^/  /'
 
+section "Business event field names (what consumers actually receive)"
+# The published contract and the schema Debezium infers from the outbox payload
+# are two different things. A mismatch decodes without error and then reads as
+# empty everywhere, so compare this against each service's schemas/*.avsc.
+for subject in $(curl -fsS "${REGISTRY_URL}/subjects" 2>/dev/null \
+                  | jq -r '.[]' | grep -E '^business\..*-value$' | sort); do
+  printf '  %s\n' "${subject}"
+  curl -fsS "${REGISTRY_URL}/subjects/${subject}/versions/latest" 2>/dev/null \
+    | jq -r '.schema' | jq -r '[.fields[]?.name] | "    " + join(", ")' \
+    || echo "    (could not read schema)"
+done
+
 section "Outbox rows written (source of truth)"
 for pair in "customer-db:customer:customerdb" "order-db:orders:ordersdb"; do
   IFS=: read -r service user db <<<"${pair}"
