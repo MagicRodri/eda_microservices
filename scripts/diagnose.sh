@@ -80,8 +80,13 @@ section "Business event field names (what consumers actually receive)"
 for subject in $(curl -fsS "${REGISTRY_URL}/subjects" 2>/dev/null \
                   | jq -r '.[]' | grep -E '^business\..*-value$' | sort); do
   printf '  %s\n' "${subject}"
+  # Connect marks an optional value schema as such, and the Avro converter
+  # encodes that as a union ["null", record] — a JSON array, not an object — so
+  # the record has to be picked out of the branches first.
   curl -fsS "${REGISTRY_URL}/subjects/${subject}/versions/latest" 2>/dev/null \
-    | jq -r '.schema' | jq -r '[.fields[]?.name] | "    " + join(", ")' \
+    | jq -r '.schema' \
+    | jq -r 'if type == "array" then (map(select(type == "object")) | .[0]) else . end
+             | "    " + ([.fields[]?.name] | join(", "))' \
     || echo "    (could not read schema)"
 done
 
