@@ -1,0 +1,10 @@
+go 1.26.5
+
+// The two services are independent repositories, materialised under services/
+// by scripts/bootstrap.sh. This workspace exists so an editor resolves both
+// modules at once; neither module depends on the other at compile time — they
+// share nothing but the event contracts in their schemas/ directories.
+use (
+	./services/customer-service
+	./services/order-service
+)
