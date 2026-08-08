@@ -35,7 +35,12 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      # Only PLAINTEXT_HOST binds to 0.0.0.0. The other two bind to the
+      # container's own name, because advertised.listeners carries no CONTROLLER
+      # entry and Kafka falls back to the listeners entry to advertise the
+      # controller — a 0.0.0.0 there is rejected as a non-routable meta-address
+      # and the broker refuses to format its storage.
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:9093,PLAINTEXT_HOST://0.0.0.0:9092
       # In-network clients use kafka:29092; anything on the host uses
       # localhost:9092. Advertising both is what makes each side reachable.
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
