@@ -1,4 +1,4 @@
-.PHONY: help bootstrap up down logs connectors status demo test clean topics ui
+.PHONY: help bootstrap up down logs connectors status diag demo test clean topics ui
 
 COMPOSE ?= docker compose
 
@@ -6,7 +6,8 @@ help:
 	@echo "bootstrap   Clone/register the two service repos under services/"
 	@echo "up          Build and start the whole stack"
 	@echo "connectors  Register the Debezium connectors with Kafka Connect"
-	@echo "status      Show connector states"
+	@echo "status      Show connector and task states"
+	@echo "diag        Dump the whole pipeline: tasks, topics, counts, logs"
 	@echo "topics      List Kafka topics"
 	@echo "ui          Print the Kafdrop URL"
 	@echo "demo        Run the end-to-end event-loop walkthrough"
@@ -24,20 +25,21 @@ up:
 connectors:
 	bash ./scripts/register-connectors.sh
 
+# A connector stays RUNNING even when all of its tasks have died, so print both.
 status:
-	@curl -fsS http://localhost:8083/connectors \
-		| tr -d '[]"' | tr ',' '\n' \
-		| while read -r c; do \
-			printf '%-32s ' "$$c"; \
-			curl -fsS "http://localhost:8083/connectors/$$c/status" \
-				| sed -n 's/.*"connector":{"state":"\([A-Z]*\)".*/\1/p' | head -1; \
-		done
+	@curl -fsS http://localhost:8083/connectors | jq -r '.[]' | sort | while read -r c; do \
+		curl -fsS "http://localhost:8083/connectors/$$c/status" | jq -r \
+			'"\(.name)  connector=\(.connector.state)  tasks=\(if (.tasks|length)==0 then "NONE" else ([.tasks[].state]|join(",")) end)"'; \
+	done
 
 topics:
 	$(COMPOSE) exec kafka kafka-topics --bootstrap-server kafka:29092 --list
 
 ui:
 	@echo "Kafdrop: http://localhost:$${KAFDROP_HOST_PORT:-9000}"
+
+diag:
+	bash ./scripts/diagnose.sh
 
 demo:
 	bash ./scripts/demo.sh

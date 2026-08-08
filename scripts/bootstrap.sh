@@ -16,7 +16,13 @@ for repo in customer-service order-service; do
   url="https://github.com/${ORG}/${repo}.git"
 
   if [ -f "${target}/go.mod" ]; then
-    echo "${target} already present, skipping"
+    # Already there — update it rather than silently keeping whatever commit
+    # was cloned first, which would quietly run stale service code.
+    echo "Updating ${repo}"
+    git -C "${target}" fetch --quiet origin "${BRANCH}" \
+      && git -C "${target}" checkout --quiet "${BRANCH}" \
+      && git -C "${target}" merge --quiet --ff-only "origin/${BRANCH}" \
+      || echo "  could not fast-forward ${target}; leaving it alone"
     continue
   fi
 
