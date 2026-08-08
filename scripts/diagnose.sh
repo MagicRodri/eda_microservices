@@ -43,10 +43,19 @@ else
   done
 fi
 
-section "connect log"
+section "connect errors (whole log)"
+# Scanned in full rather than tailed: a transform that rejects a row throws once,
+# at insert time, and the routine chatter that follows pushes it out of any tail.
+$COMPOSE logs --no-log-prefix connect 2>/dev/null \
+  | grep -E 'ERROR|WARN|Exception|Caused by|DataException|ConnectException' \
+  | grep -Ev 'UNKNOWN_TOPIC_OR_PARTITION' \
+  | tail -40 \
+  || echo "  none"
+
+section "connect log (tail)"
 $COMPOSE logs --tail 60 --no-log-prefix connect 2>/dev/null \
-  | grep -Ev 'INFO.*(WorkerSourceTask|AbstractCoordinator|ConsumerConfig|ProducerConfig)' \
-  | tail -40
+  | grep -Ev 'INFO.*(RestServer|WorkerSourceTask|AbstractCoordinator|ConsumerConfig|ProducerConfig)' \
+  | tail -25
 
 section "Topics"
 kafka_topics | sort | sed 's/^/  /'
@@ -68,9 +77,14 @@ section "Outbox rows written (source of truth)"
 for pair in "customer-db:customer:customerdb" "order-db:orders:ordersdb"; do
   IFS=: read -r service user db <<<"${pair}"
   printf '  %s:\n' "${service}"
+  # The full row matters, not just a count: the router reads channel, id,
+  # aggregate_id, event_type and created_at, and rejects the row if any of them
+  # is not the shape it expects.
   $COMPOSE exec -T "${service}" psql -U "${user}" -d "${db}" -At -c \
-    "SELECT '    ' || channel || ' ' || event_type || ' x' || count(*)
-       FROM outbox GROUP BY channel, event_type ORDER BY 1" 2>/dev/null \
+    "SELECT '    channel=' || channel || ' event_type=' || event_type
+            || ' aggregate_id=' || aggregate_id
+            || ' created_at=' || created_at
+       FROM outbox ORDER BY created_at DESC LIMIT 5" 2>/dev/null \
     || echo "    (query failed)"
 done
 
