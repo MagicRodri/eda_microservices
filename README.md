@@ -38,6 +38,275 @@ when viewing a topic shows decoded records instead of raw bytes.
 | customer-service  | http://localhost:8091   |
 | order-service     | http://localhost:8092   |
 
+## Visual model
+
+### Architecture
+
+Each service owns its database and publishes through its own outbox connector.
+Kafka is the only cross-service transport: there are no synchronous HTTP calls
+between the services.
+
+```mermaid
+flowchart LR
+  client[HTTP clients]
+
+  subgraph customer[customer-service]
+    customerAPI[HTTP API<br/>:8091]
+    customerApp[Customer application]
+    customerDB[(customer-db<br/>PostgreSQL)]
+    customerConsumer[Business and technical<br/>consumers]
+    customerAPI --> customerApp
+    customerApp --> customerDB
+    customerConsumer --> customerDB
+  end
+
+  subgraph order[order-service]
+    orderAPI[HTTP API<br/>:8092]
+    orderApp[Order application]
+    orderDB[(order-db<br/>PostgreSQL)]
+    orderConsumer[Business and technical<br/>consumers]
+    orderAPI --> orderApp
+    orderApp --> orderDB
+    orderConsumer --> orderDB
+  end
+
+  subgraph platform[Event platform]
+    connect[Kafka Connect<br/>Debezium]
+    kafka[(Kafka)]
+    registry[Schema Registry<br/>Avro]
+  end
+
+  client --> customerAPI
+  client --> orderAPI
+  customerDB -->|WAL: tables and outbox| connect
+  orderDB -->|WAL: tables and outbox| connect
+  connect --> kafka
+  connect --> registry
+  kafka --> customerConsumer
+  kafka --> orderConsumer
+  registry -. writer schemas .-> customerConsumer
+  registry -. writer schemas .-> orderConsumer
+
+  classDef service fill:#e8f3ef,stroke:#28745a,color:#163b2c
+  classDef data fill:#fff4d6,stroke:#b7791f,color:#513708
+  classDef platform fill:#e8eef8,stroke:#4267a8,color:#1f3155
+  class customerAPI,customerApp,customerConsumer,orderAPI,orderApp,orderConsumer service
+  class customerDB,orderDB data
+  class connect,kafka,registry platform
+```
+
+### Event and request flow
+
+The two streams share the same WAL but have different contracts. Technical
+events stay inside the owning service for audit; business events cross the
+service boundary and update a local projection.
+
+```mermaid
+flowchart TD
+  create[POST /customers] --> customerTx[Customer transaction]
+  customerTx --> customerRow[(customers row)]
+  customerTx --> customerOutbox[(outbox row<br/>CustomerCreated)]
+  customerOutbox --> customerCDC[Debezium outbox router]
+  customerCDC --> customerTopic[[business.customer.lifecycle.events]]
+  customerTopic --> viewHandler[order-service business handler]
+  viewHandler --> processed[(processed_events)]
+  viewHandler --> view[(customer_view)]
+
+  order[POST /orders] --> orderTx[Order transaction]
+  view --> orderTx
+  orderTx --> orderRow[(orders row)]
+  orderTx --> orderOutbox[(outbox row<br/>OrderCreated)]
+  orderOutbox --> orderCDC[Debezium outbox router]
+  orderCDC --> orderTopic[[business.order.lifecycle.events]]
+  orderTopic --> spendHandler[customer-service business handler]
+  spendHandler --> processedSpend[(processed_events)]
+  spendHandler --> spend[Update lifetime spend]
+  spend --> tier{Tier changed?}
+  tier -->|yes, same transaction| tierOutbox[(outbox row<br/>CustomerTierChanged)]
+  tierOutbox --> tierCDC[Debezium outbox router]
+  tierCDC --> loyaltyTopic[[business.customer.loyalty.events]]
+  loyaltyTopic --> viewHandler
+
+  customerRow -. CDC .-> techCustomer[[tech.customer.public.customers]]
+  orderRow -. CDC .-> techOrder[[tech.order.public.orders]]
+  techCustomer -. audit only .-> customerAudit[(customer technical_audit_log)]
+  techOrder -. audit only .-> orderAudit[(order technical_audit_log)]
+
+  classDef command fill:#e8eef8,stroke:#4267a8,color:#1f3155
+  classDef transaction fill:#e8f3ef,stroke:#28745a,color:#163b2c
+  classDef topic fill:#fff4d6,stroke:#b7791f,color:#513708
+  class create,order command
+  class customerTx,orderTx,viewHandler,spendHandler,tier transaction
+  class customerTopic,orderTopic,loyaltyTopic,techCustomer,techOrder topic
+```
+
+### Method sequences
+
+#### `POST /customers` and `POST /orders`
+
+Both commands validate and persist domain state plus their business event in a
+single database transaction. Kafka publication happens later from the WAL.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Client
+  participant CustomerAPI as customer-service API
+  participant CustomerApp as CustomerApp.CreateCustomer
+  participant CustomerDB@{ "type": "database" }
+  participant CustomerConnect as Debezium customer connector
+  participant Kafka@{ "type": "queue" }
+  participant OrderConsumer as order-service HandleBusinessEvent
+  participant OrderDB@{ "type": "database" }
+  participant OrderAPI as order-service API
+  participant OrderApp as OrderApp.CreateOrder
+  participant OrderConnect as Debezium order connector
+  participant CustomerConsumer as customer-service HandleBusinessEvent
+
+  Client->>CustomerAPI: POST /customers
+  CustomerAPI->>CustomerApp: validate email and name
+  CustomerApp->>CustomerDB: BEGIN
+  CustomerApp->>CustomerDB: INSERT customers
+  CustomerApp->>CustomerDB: INSERT outbox(CustomerCreated)
+  CustomerApp->>CustomerDB: COMMIT
+  CustomerAPI-->>Client: 201 customer
+  CustomerConnect->>Kafka: publish business.customer.lifecycle.events
+  Kafka->>OrderConsumer: CustomerCreated
+  OrderConsumer->>OrderDB: transaction: mark processed + upsert customer_view
+  OrderConsumer->>OrderDB: COMMIT
+
+  Client->>OrderAPI: POST /orders
+  OrderAPI->>OrderApp: validate, authorize, and price
+  OrderApp->>OrderDB: read customer_view
+  OrderApp->>OrderDB: BEGIN
+  OrderApp->>OrderDB: INSERT orders
+  OrderApp->>OrderDB: INSERT outbox(OrderCreated)
+  OrderApp->>OrderDB: COMMIT
+  OrderAPI-->>Client: 201 order
+  OrderConnect->>Kafka: publish business.order.lifecycle.events
+  Kafka->>CustomerConsumer: OrderCreated
+  CustomerConsumer->>CustomerDB: transaction: mark processed + update spend
+  CustomerConsumer->>CustomerDB: COMMIT
+```
+
+#### Reactive event handler and idempotency
+
+The same transaction records the consumed event, applies its effect, and emits
+the next event when a tier threshold is crossed. A redelivery exits after
+`MarkProcessed` reports that the event was already handled.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Kafka@{ "type": "queue" }
+  participant Handler as customer-service HandleBusinessEvent
+  participant DB@{ "type": "database" }
+  participant Connector as Debezium outbox connector
+  participant OrderHandler as order-service HandleBusinessEvent
+  participant OrderDB@{ "type": "database" }
+
+  Kafka->>Handler: OrderCreated or OrderCancelled
+  Handler->>DB: BEGIN
+  Handler->>DB: MarkProcessed(event_id, topic)
+  alt duplicate event
+    DB-->>Handler: fresh = false
+    Handler->>DB: ROLLBACK / no-op
+  else first delivery
+    DB-->>Handler: fresh = true
+    Handler->>DB: update customer lifetime spend
+    alt tier changed
+      Handler->>DB: INSERT outbox(CustomerTierChanged)
+    end
+    Handler->>DB: COMMIT
+  end
+  Connector->>Kafka: publish business.customer.loyalty.events
+  Kafka->>OrderHandler: CustomerTierChanged
+  OrderHandler->>OrderDB: mark processed + update local customer_view
+```
+
+### Availability scenarios
+
+#### Order request while customer-service is unavailable
+
+`POST /orders` does not call customer-service. If the order service already has
+the customer in its local view, it can authorize and price the order while the
+customer service is down. The resulting `OrderCreated` event remains in Kafka
+until the customer consumer returns; the customer spend projection is delayed,
+not lost.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Client
+  participant OrderAPI as order-service API
+  participant OrderApp as OrderApp.CreateOrder
+  participant OrderDB@{ "type": "database" }
+  participant OrderConnect as Debezium order connector
+  participant Kafka@{ "type": "queue" }
+  participant CustomerService as customer-service unavailable
+  participant CustomerDB@{ "type": "database" }
+
+  Note over CustomerService: process is down when the request arrives
+  Client->>OrderAPI: POST /orders
+  OrderAPI->>OrderApp: validate, authorize, and price
+  OrderApp->>OrderDB: read known customer_view
+  OrderApp->>OrderDB: BEGIN
+  OrderApp->>OrderDB: INSERT orders
+  OrderApp->>OrderDB: INSERT outbox(OrderCreated)
+  OrderApp->>OrderDB: COMMIT
+  OrderAPI-->>Client: 201 order
+  OrderConnect->>Kafka: publish OrderCreated
+  Kafka-->>CustomerService: delivery pending
+  Note over Kafka: event is retained for the consumer group
+
+  CustomerService-->>Kafka: service restarts and resumes
+  Kafka->>CustomerService: redeliver OrderCreated
+  CustomerService->>CustomerDB: mark processed + update spend
+  CustomerService->>CustomerDB: COMMIT
+```
+
+If `customer_view` has never received `CustomerCreated`, the order request
+returns `409` instead. The local projection is the availability boundary: a
+known customer can be served with bounded staleness, while an unknown customer
+cannot be safely authorized.
+
+#### Customer request while order-service is unavailable
+
+`POST /customers` has the same isolation in the other direction. The customer
+row and `CustomerCreated` event commit together even when order-service cannot
+consume Kafka. Once order-service returns, it builds its local view and can
+accept orders for that customer.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Client
+  participant CustomerAPI as customer-service API
+  participant CustomerApp as CustomerApp.CreateCustomer
+  participant CustomerDB@{ "type": "database" }
+  participant CustomerConnect as Debezium customer connector
+  participant Kafka@{ "type": "queue" }
+  participant OrderService as order-service unavailable
+  participant OrderDB@{ "type": "database" }
+
+  Note over OrderService: process is down when the request arrives
+  Client->>CustomerAPI: POST /customers
+  CustomerAPI->>CustomerApp: validate email and name
+  CustomerApp->>CustomerDB: BEGIN
+  CustomerApp->>CustomerDB: INSERT customers
+  CustomerApp->>CustomerDB: INSERT outbox(CustomerCreated)
+  CustomerApp->>CustomerDB: COMMIT
+  CustomerAPI-->>Client: 201 customer
+  CustomerConnect->>Kafka: publish CustomerCreated
+  Kafka-->>OrderService: delivery pending
+  Note over Kafka: event is retained for the consumer group
+
+  OrderService-->>Kafka: service restarts and resumes
+  Kafka->>OrderService: redeliver CustomerCreated
+  OrderService->>OrderDB: mark processed + upsert customer_view
+  OrderService->>OrderDB: COMMIT
+```
+
 ## The two kinds of events
 
 Both streams come out of the same Postgres WAL, through the same Kafka Connect
